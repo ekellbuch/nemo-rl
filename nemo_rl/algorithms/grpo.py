@@ -366,6 +366,11 @@ class GRPOConfig(BaseModel, extra="allow"):
     # still reads as a failure for its siblings; they never contribute a
     # gradient either way. Placeholder and seq-logprob-error rows stay excluded.
     masked_sample_rewards_in_baseline: bool = False
+    # SingleController GRPO only. When every trained token of a step has advantage
+    # 0, drop the step's gradients instead of calling optimizer.step: the gradient
+    # is zero, but Adam's momentum would still move the weights. The lr scheduler
+    # does not advance on a dropped step.
+    skip_zero_advantage_steps: bool = False
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False

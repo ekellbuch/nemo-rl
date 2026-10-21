@@ -2095,6 +2095,67 @@ def test_train_pump_skips_empty_chunk_and_trains_later_valid_chunk(
     assert ctrl._train_steps == 1
 
 
+@pytest.mark.parametrize(
+    ("skip_enabled", "advantages", "expect_skip"),
+    [
+        (True, [[0.0, 0.0], [0.0]], True),
+        (True, [[0.0, 0.0], [0.0, 0.5]], False),
+        (False, [[0.0, 0.0], [0.0]], False),
+        # No advantage estimator: nothing is logged, so nothing is skipped.
+        (True, None, False),
+    ],
+)
+def test_train_pump_skips_optimizer_step_on_all_zero_advantages(
+    monkeypatch, skip_enabled, advantages, expect_skip
+) -> None:
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{i}"],
+            fields=[],
+            sequence_lengths=[1],
+            tags=[{"weight_version": 0}],
+        )
+        for i in range(2)
+    ]
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(list(metas)))
+    ctrl._master_config.grpo.skip_zero_advantage_steps = skip_enabled
+    chunk_advantages = iter(advantages or [])
+
+    async def advantage_stage(meta):
+        # The real stage logs each chunk's trained-token advantages here.
+        if advantages is not None:
+            ctrl._step_log_dict["masked_advantages"].append(
+                torch.tensor(next(chunk_advantages))
+            )
+        return meta, True
+
+    ctrl._advantage_stage = advantage_stage
+    trainer = MagicMock(spec=_NoOpTrainer)
+    trainer.abort_train_step = MagicMock()
+    trainer.finish_train_step.return_value = {}
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert trainer.train_microbatches_from_meta.call_count == 2
+    assert trainer.abort_train_step.call_count == int(expect_skip)
+    assert trainer.finish_train_step.call_count == int(not expect_skip)
+    # The version still advances and the unchanged weights are refit.
+    ctrl._sync_weights.assert_awaited_once()
+    assert ctrl._train_steps == 1
+    logged = [
+        call.args[0]
+        for call in ctrl._logger.log_metrics.call_args_list
+        if "skipped_zero_advantage_step" in call.args[0]
+    ]
+    assert bool(logged) is expect_skip
+
+
 def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
     meta = KVBatchMeta(
         partition_id="rollout_data",

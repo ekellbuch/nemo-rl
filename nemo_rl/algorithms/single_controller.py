@@ -3078,14 +3078,35 @@ class SingleControllerActor:
                             "to avoid an optimizer step with an empty batch."
                         )
 
-                    with self._timer.time("policy_training"):
-                        policy_result = await asyncio.to_thread(
-                            self._trainer.finish_train_step
+                    # grpo.skip_zero_advantage_steps: masked_advantages holds every
+                    # trained token's advantage of this step's chunks (nothing when
+                    # there is no advantage estimator).
+                    step_advantages = self._step_log_dict["masked_advantages"]
+                    skip_zero_advantage_step = (
+                        bool(
+                            getattr(self._algo_cfg, "skip_zero_advantage_steps", False)
                         )
+                        and bool(step_advantages)
+                        and not any(bool(adv.any()) for adv in step_advantages)
+                    )
+                    with self._timer.time("policy_training"):
+                        if skip_zero_advantage_step:
+                            log.info(
+                                "train_pump: step %d has only zero advantages; "
+                                "dropping its gradients without an optimizer step",
+                                version_during_step,
+                            )
+                            await asyncio.to_thread(self._trainer.abort_train_step)
+                        else:
+                            policy_result = await asyncio.to_thread(
+                                self._trainer.finish_train_step
+                            )
                     self._optimizer_commit_in_progress = True
 
                 # Aggregate step metrics
                 step_metrics = {}
+                if not self._is_ppo and skip_zero_advantage_step:
+                    step_metrics["skipped_zero_advantage_step"] = 1.0
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
