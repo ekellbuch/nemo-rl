@@ -5082,7 +5082,11 @@ class SingleControllerActor:
             # weights everywhere; a refused reset is worth a loud line in the run log.
             print(
                 "  _sync_weights: generation prefix/KV caches "
-                + ("reset after refit" if reset_ok else "NOT reset after refit (see worker logs)"),
+                + (
+                    "reset after refit"
+                    if reset_ok
+                    else "NOT reset after refit (see worker logs)"
+                ),
                 flush=True,
             )
         elapsed = time.monotonic() - t0

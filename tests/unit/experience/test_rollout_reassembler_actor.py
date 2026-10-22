@@ -196,6 +196,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "drop_reason",
         "valid_row_count",
         "total_row_count",
+        # rollout_id strings of the verified rows, for the pass-rate curriculum.
+        "valid_rollout_ids",
     }
 
 
