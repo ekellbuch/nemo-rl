@@ -50,6 +50,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutRecoveryConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.data.curriculum_sampler import (
+    PassRateCurriculumConfig,
+    PassRateCurriculumSampler,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
@@ -1132,6 +1136,9 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             self.two_generated = asyncio.Event()
             self.stats = SimpleNamespace(committed=0)
 
+        def record_finalized_group(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
         async def generate_for_finalization(
             self,
             prompt: Any,
@@ -1213,6 +1220,125 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
     asyncio.run(_main())
 
 
+def test_actor_path_feeds_kept_and_dropped_groups_to_the_curriculum() -> None:
+    """A group dropped for too few verified rows still counts; masked rows do not."""
+    sampler = PassRateCurriculumSampler(
+        8,
+        PassRateCurriculumConfig(enabled=True, prior_strength=1e-9),
+        group_size=4,
+        seed=0,
+    )
+    rewards_by_group = {"g1": (1.0, 1.0, 0.0, 1.0), "g2": (1.0, 0.0, 1.0, 0.0)}
+
+    class _CurriculumRolloutManager:
+        # The real feedback path, on a fake that skips generation.
+        record_finalized_group = RolloutManager.record_finalized_group
+
+        def __init__(self) -> None:
+            self._curriculum = sampler
+            self.generated = 0
+            self.stats = SimpleNamespace(committed=0)
+            self.dropped_prompts = 0
+
+        def record_finalizer_dropped_prompt(self) -> None:
+            self.dropped_prompts += 1
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        ) -> Any:
+            del target_step, inflight_registry
+            self.generated += 1
+            group_id = f"g{self.generated}"
+            return SimpleNamespace(
+                group_id=group_id,
+                prompt_idx=prompt["idx"],
+                rollout_ids=("r0", "r1", "r2", "r3"),
+                rewards=rewards_by_group[group_id],
+                mask_sample=(False, False, True, False),
+                loss_multiplier=1.0,
+            )
+
+    # g1 (task 3): r2 env-masked, r3 failed to verify, so 3/4 valid rows fall below
+    # the 0.9 threshold and the group is replaced. g2 (task 5, the spare) is kept.
+    async def _finalize(request: Any) -> Any:
+        valid = ("r0", "r1", "r2") if request.group_id == "g1" else request.rollout_ids
+        return SimpleNamespace(
+            valid_row_count=len(valid),
+            total_row_count=4,
+            valid_rollout_ids=valid,
+        )
+
+    async def _cleanup(request: Any) -> None:
+        del request
+
+    spares = [{"message_log": [{"role": "user", "content": "spare"}], "idx": 5}]
+
+    def _take_replacement(target_step: int | None, used: int) -> Any:
+        del target_step, used
+        return spares.pop() if spares else None
+
+    async def _main() -> None:
+        manager = _CurriculumRolloutManager()
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1,
+            diagnostics=False,
+            rollout_failure=_failure_cfg(),
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(min_valid_fraction_per_group=0.9),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        ctrl._rollout_manager = manager
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = _finalize
+        ctrl._cleanup_known_finalization_request = _cleanup
+        ctrl._take_replacement = _take_replacement
+        ctrl._credit_shortfall = lambda _step: None
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict(
+                {
+                    "message_log": [[{"role": "user", "content": "first"}]],
+                    "idx": [3],
+                }
+            )
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await asyncio.wait_for(ctrl._rollout_pump(), timeout=1.0)
+
+        assert manager.generated == 2
+        assert manager.stats.committed == 1
+        assert manager.dropped_prompts == 0
+
+    asyncio.run(_main())
+
+    pass_rates = sampler.pass_rates()
+    # Task 3: r0 and r1 pass (r2 masked, r3 unverified). Task 5: one pass in three.
+    assert pass_rates[3].item() == pytest.approx(1.0)
+    assert pass_rates[5].item() == pytest.approx(1 / 3)
+    metrics = sampler.metrics()
+    assert metrics["curriculum/tracked_tasks"] == 2.0
+    assert metrics["curriculum/groups_observed_total"] == 2.0
+    assert metrics["curriculum/all_pass_fraction"] == pytest.approx(0.5)
+
+
 @pytest.mark.parametrize("committed", [False, True])
 def test_actor_finalization_discards_recovery_ledger_ownership(
     committed: bool,
@@ -1262,6 +1388,9 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
             group_id: str,
         ) -> None:
             self.recovery_ledger.discard_group(cut, group_id)
+
+        def record_finalized_group(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
 
         async def generate_for_finalization(
             self,

@@ -22,12 +22,16 @@ training cluster after the policy has stepped off it.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import cloudpickle
 import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.advantage_estimator import (
@@ -52,6 +56,10 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     validate_single_controller_config,
+)
+from nemo_rl.data.curriculum_sampler import (
+    PassRateCurriculumConfig,
+    PassRateCurriculumSampler,
 )
 
 _NUM_PROMPTS_PER_STEP = 4
@@ -448,6 +456,168 @@ class TestPPOValidation:
         mc.async_rl.sampler = WindowedSamplerConfig()
 
         validate_single_controller_config(mc)
+
+
+class TestCurriculumSetup:
+    """The pass-rate curriculum is GRPO-only and becomes the dataloader's sampler."""
+
+    def test_accepts_the_default_mixed_group_curriculum(self):
+        mc = _make_master_config()
+        mc.grpo.curriculum = PassRateCurriculumConfig(enabled=True)
+
+        validate_single_controller_config(mc)
+
+    def test_mixed_group_rejects_a_single_generation_per_prompt(self):
+        mc = _make_master_config()
+        mc.grpo.curriculum = PassRateCurriculumConfig(enabled=True)
+        mc.grpo.num_generations_per_prompt = 1
+
+        with pytest.raises(ValueError, match="num_generations_per_prompt >= 2"):
+            validate_single_controller_config(mc)
+
+    def test_variance_allows_a_single_generation_per_prompt(self):
+        mc = _make_master_config()
+        mc.grpo.curriculum = PassRateCurriculumConfig(
+            enabled=True, weighting="variance"
+        )
+        mc.grpo.num_generations_per_prompt = 1
+        mc.policy["train_global_batch_size"] = _NUM_PROMPTS_PER_STEP
+
+        validate_single_controller_config(mc)
+
+    def test_ppo_rejects_a_curriculum_block(self):
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                curriculum={"enabled": True}, max_num_steps=100, **_STEP_CONFIG
+            )
+        )
+
+        with pytest.raises(ValueError, match="GRPO-only"):
+            validate_single_controller_config(mc)
+
+    def test_ppo_accepts_a_disabled_curriculum_block(self):
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                curriculum={"enabled": False}, max_num_steps=100, **_STEP_CONFIG
+            )
+        )
+
+        validate_single_controller_config(mc)
+
+    def test_disabled_curriculum_builds_no_sampler(self):
+        assert (
+            sc_setup_mod._build_curriculum_sampler(_make_master_config(), [0]) is None
+        )
+
+    def test_sampler_is_shared_with_the_manager_across_a_pickle(self):
+        # actor_args reaches the controller as one pickle, so the dataloader's sampler
+        # and the manager's curriculum must still be one object on the other side.
+        mc = _make_master_config()
+        mc.grpo.curriculum = PassRateCurriculumConfig(enabled=True)
+        sampler = sc_setup_mod._build_curriculum_sampler(mc, list(range(10)))
+        assert isinstance(sampler, PassRateCurriculumSampler)
+        assert len(sampler) == 10
+        loader = StatefulDataLoader(
+            list(range(10)), batch_size=2, sampler=sampler, drop_last=True
+        )
+        holder = SimpleNamespace(curriculum=sampler)
+
+        loader_copy, holder_copy = cloudpickle.loads(
+            cloudpickle.dumps((loader, holder))
+        )
+
+        assert loader_copy.sampler is holder_copy.curriculum
+        holder_copy.curriculum.update(0, [1.0, 1.0])
+        assert loader_copy.sampler.metrics()["curriculum/tracked_tasks"] == 1.0
+
+
+def _gym_rows(*names: str | None) -> list[dict]:
+    """Processed NeMo-Gym rows: the Gym row (with its task_name) is extra_env_info."""
+    return [
+        {"idx": i, "extra_env_info": {} if name is None else {"task_name": name}}
+        for i, name in enumerate(names)
+    ]
+
+
+class TestCurriculumInitStats:
+    """grpo.curriculum.init_stats_path seeds per-task counts, matched by task_name."""
+
+    def _config(self, path: Path) -> MasterConfig:
+        mc = _make_master_config()
+        mc.grpo.curriculum = PassRateCurriculumConfig(
+            enabled=True, prior_strength=1e-9, init_stats_path=str(path)
+        )
+        return mc
+
+    def test_jsonl_seeds_rows_by_task_name(self, tmp_path):
+        path = tmp_path / "init.jsonl"
+        path.write_text(
+            json.dumps({"task_name": "b", "passes": 6, "attempts": 8})
+            + "\n"
+            + json.dumps({"task_name": "gone", "passes": 1, "attempts": 8})
+            + "\n"
+        )
+        rows = _gym_rows("a", "b", None, "b")
+
+        sampler = sc_setup_mod._build_curriculum_sampler(self._config(path), rows)
+
+        rates = sampler.pass_rates()
+        # Both copies of b are seeded; a and the nameless row stay at the prior.
+        assert rates[1].item() == pytest.approx(0.75)
+        assert rates[3].item() == pytest.approx(0.75)
+        metrics = sampler.metrics()
+        assert metrics["curriculum/tracked_tasks"] == 2.0
+        assert metrics["curriculum/groups_observed_total"] == 0.0
+
+    def test_json_mapping_is_accepted(self, tmp_path):
+        path = tmp_path / "init.json"
+        path.write_text(json.dumps({"a": {"passes": 0, "attempts": 8}}))
+
+        sampler = sc_setup_mod._build_curriculum_sampler(
+            self._config(path), _gym_rows("a", "b")
+        )
+
+        assert sampler.metrics()["curriculum/all_fail_fraction"] == 1.0
+
+    def test_no_matching_row_is_an_error(self, tmp_path):
+        path = tmp_path / "init.jsonl"
+        path.write_text(json.dumps({"task_name": "x", "passes": 1, "attempts": 2}))
+
+        with pytest.raises(ValueError, match="no training row"):
+            sc_setup_mod._build_curriculum_sampler(self._config(path), _gym_rows("a"))
+
+    def test_invalid_counts_are_rejected(self, tmp_path):
+        path = tmp_path / "init.jsonl"
+        path.write_text(json.dumps({"task_name": "a", "passes": 3, "attempts": 2}))
+
+        with pytest.raises(ValueError, match="passes <= attempts"):
+            sc_setup_mod._build_curriculum_sampler(self._config(path), _gym_rows("a"))
+
+    def test_seeded_counts_decay_like_observed_ones(self, tmp_path):
+        path = tmp_path / "init.jsonl"
+        path.write_text(json.dumps({"task_name": "a", "passes": 8, "attempts": 8}))
+        mc = self._config(path)
+        mc.grpo.curriculum.decay = 0.5
+
+        sampler = sc_setup_mod._build_curriculum_sampler(mc, _gym_rows("a"))
+        sampler.update(0, [0.0, 0.0, 0.0, 0.0])
+
+        # passes 0.5 * 8 = 4, attempts 0.5 * 8 + 4 = 8
+        assert sampler.pass_rates()[0].item() == pytest.approx(0.5)
+
+    def test_a_resume_replaces_the_seeded_counts(self, tmp_path):
+        path = tmp_path / "init.jsonl"
+        path.write_text(json.dumps({"task_name": "a", "passes": 8, "attempts": 8}))
+        sampler = sc_setup_mod._build_curriculum_sampler(
+            self._config(path), _gym_rows("a", "b")
+        )
+        fresh = PassRateCurriculumSampler(
+            2, PassRateCurriculumConfig(enabled=True), group_size=2, seed=0
+        )
+
+        sampler.import_state(fresh.export_state())
+
+        assert sampler.metrics()["curriculum/tracked_tasks"] == 0.0
 
 
 class TestAdvantageEstimatorSelection:

@@ -310,6 +310,41 @@ Field definitions:
 - `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a batch. Set to `num_prompts_per_step` for sync/legacy semantics; lower for streaming. (PPO) Must equal `num_prompts_per_step` — the critic has no split train API, so each critic epoch calls the full-step `train_from_meta` once per chunk. Splitting an RL step across chunks would multiply both models' configured optimizer updates by the number of chunks.
 - `sampler.warmup_lookahead_versions` (PPO) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
 
+## Pass-rate curriculum
+
+An all-pass or all-fail group has zero advantage, so its rollouts train nothing. `grpo.curriculum` makes such tasks less likely to be drawn in the first place. It tracks a pass rate per dataset row, updated online from finished groups, and the training dataloader draws prompts with replacement, weighted toward tasks whose next group is likely to have reward spread. Unlike an offline pass-rate filter built from the starting checkpoint, it follows the policy as it improves.
+
+```yaml
+grpo:
+  curriculum:
+    enabled: true
+    weighting: mixed_group  # 1 - p^n - (1-p)^n with n = num_generations_per_prompt; or variance: p(1-p); or uniform
+    decay: 0.7              # a task's counts are multiplied by this before each new group of it is added
+    prior_pass_rate: 0.5    # Beta prior mean for unseen tasks
+    prior_strength: 2.0     # prior weight, in rollouts
+    min_weight: 0.05        # weight floor as a fraction of the curve's peak, so no task starves
+    pass_threshold: 0.5     # a rollout passes when its reward is above this
+    init_stats_path: null   # optional per-task prior counts, e.g. from a profiling run
+```
+
+- The estimate is `p = (passes + prior_strength * prior_pass_rate) / (attempts + prior_strength)`. Both curves are scaled to peak at 1, so `min_weight` means the same for either. With the default prior, unseen tasks get the peak weight and are tried early.
+- Every finished group counts, including one dropped for falling below `token_capture.min_valid_fraction_per_group`. Rollouts the environment flags with `mask_sample`, rows that fail token-capture verification, and prompts with `loss_multiplier: 0` are not counted, and neither are groups lost to infrastructure failures.
+- `init_stats_path` seeds the counts before the first draw, so a run can start from a profile instead of the prior. It is JSONL with one `{"task_name": ..., "passes": ..., "attempts": ...}` record per task, a JSON list of such records, or a JSON object mapping `task_name` to `{"passes", "attempts"}`. A row matches on its Gym row's `task_name` (`extra_env_info.task_name`), not on its dataset index, so the file survives reordering or filtering the data file; every row with a matching name is seeded, rows without one keep the prior, and setup fails if no row matches. Seeded counts decay like observed ones and are not counted in `groups_observed_total`. A checkpoint resume restores the saved statistics instead.
+- An epoch is still `len(dataset)` draws, so `max_num_epochs` and the `max_num_steps` clamp behave as before. `data.shuffle` is ignored while the curriculum is on.
+- The statistics and the draw generator are saved in `train_dataloader.pt` and restored on resume. A resume may switch the curriculum on or off, but not change the dataset size.
+- Updates happen in the controller as groups finish. Prompts already in flight were drawn with older weights, so the draws lag the estimates by about `max_inflight_prompts` groups.
+- It composes with `grpo.skip_zero_advantage_steps`: the curriculum lowers the zero-variance rate, and a step whose groups all still have zero advantage is skipped. GRPO only; setup rejects it on the legacy GRPO entry point and on PPO.
+
+Per-step metrics:
+
+| Metric | Meaning |
+| --- | --- |
+| `curriculum/tracked_tasks` | Tasks with at least one counted or seeded rollout. |
+| `curriculum/mean_pass_rate` | Mean estimated pass rate over tracked tasks. |
+| `curriculum/all_pass_fraction` / `curriculum/all_fail_fraction` | Fraction of tracked tasks whose every counted rollout passed / failed. |
+| `curriculum/effective_sample_size` / `curriculum/effective_sample_fraction` | `(Σw)² / Σw²` over the draw weights, and that divided by the dataset size (1.0 is uniform). |
+| `curriculum/groups_observed_total` | Groups fed to the curriculum so far. |
+
 ## Implementation Structure
 
 The SC path splits the async-GRPO loop across a rollout pump and a train pump that share a `TQReplayBuffer` and are orchestrated by the `SingleControllerActor`.

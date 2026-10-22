@@ -29,6 +29,17 @@ grpo:
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
+  # Online pass-rate curriculum (SingleController only): draw prompts with replacement,
+  # weighted toward tasks whose GRPO group is likely to have reward spread.
+  curriculum:
+    enabled: false
+    weighting: mixed_group  # mixed_group: 1-p^n-(1-p)^n; variance: p(1-p); uniform
+    decay: 0.7  # per-task evidence multiplier applied before each new group
+    prior_pass_rate: 0.5  # unseen-task pass rate (Beta prior mean)
+    prior_strength: 2.0  # prior weight, in rollouts
+    min_weight: 0.05  # weight floor as a fraction of the peak
+    pass_threshold: 0.5  # reward above this counts as a pass
+    init_stats_path: null  # optional JSON/JSONL of {task_name, passes, attempts} that seeds the stats
   reward_shaping:
     enabled: false
     overlong_buffer_length: 128

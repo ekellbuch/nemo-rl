@@ -92,6 +92,7 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _EffortShapingMetrics,
     _find_routed_experts_template,
+    _mask_sample_flags,
     _tensorize_by_key,
     apply_reward_penalties,
     attach_static_multimodal_payload,
@@ -110,6 +111,8 @@ RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
+    from nemo_rl.data.curriculum_sampler import PassRateCurriculumSampler
+    from nemo_rl.experience.rollout_reassembler import FinalizedGroup
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
 
@@ -1674,10 +1677,14 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        curriculum: Optional["PassRateCurriculumSampler"] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
+        # The training dataloader's sampler when grpo.curriculum is on: every finished
+        # group updates its task's pass-rate estimate.
+        self._curriculum = curriculum
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
         # budget out of it at construction time, and shares the counters so its
         # row-level re-dispatches land in the same place as everything else.
@@ -1879,6 +1886,53 @@ class RolloutManager:
     def recovery_ledger(self) -> RolloutRecoveryLedger:
         """Return the prompt-group ownership ledger shared with the controller."""
         return self._recovery_ledger
+
+    def curriculum_metrics(self) -> dict[str, float]:
+        """The curriculum's step-log metrics, or nothing when it is off."""
+        if self._curriculum is None:
+            return {}
+        return self._curriculum.metrics()
+
+    def _record_completed_group(self, record: PromptGroupRecord) -> None:
+        """Feed a committed non-capture group to the curriculum, minus env-masked rollouts.
+
+        All-pass and all-fail groups count too: they are exactly the signal the
+        curriculum needs.
+        """
+        # loss_multiplier 0: the dataset masked the whole prompt, so its rewards say nothing.
+        if self._curriculum is None or record.loss_multiplier == 0:
+            return
+        masked = _mask_sample_flags(c.env_extras for c in record.completions)
+        self._curriculum.update(
+            record.prompt_idx,
+            [
+                c.reward
+                for c, is_masked in zip(record.completions, masked.tolist())
+                if not is_masked
+            ],
+        )
+
+    def record_finalized_group(
+        self, request: "ReassemblyRequest", finalized: "FinalizedGroup"
+    ) -> None:
+        """Feed a token-capture group to the curriculum, minus masked and unverified rows.
+
+        The controller calls this before deciding whether to drop the group.
+        Only rows in ``finalized.valid_rollout_ids`` (those that verified) count.
+        """
+        if self._curriculum is None or request.loss_multiplier == 0:
+            return
+        valid = set(finalized.valid_rollout_ids)
+        self._curriculum.update(
+            request.prompt_idx,
+            [
+                reward
+                for rollout_id, reward, is_masked in zip(
+                    request.rollout_ids, request.rewards, request.mask_sample
+                )
+                if rollout_id in valid and not is_masked
+            ],
+        )
 
     def record_finalizer_dropped_prompt(self) -> None:
         """Count a controller-side drop after generation and finalization succeeded.
@@ -2239,6 +2293,8 @@ class RolloutManager:
                 raise
 
             self._stats.committed += 1
+            # Outside the try: a curriculum error must not re-run a committed rollout.
+            self._record_completed_group(record)
             rollout_metrics = record.rollout_metrics
             mean_output_tokens = rollout_metrics.get("mean_gen_tokens_per_sample", 0)
             output_tokens = 0

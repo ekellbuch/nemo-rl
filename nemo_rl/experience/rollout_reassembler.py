@@ -115,6 +115,8 @@ class FinalizedGroup:
     # (the caller does not read these when dropped is True).
     valid_row_count: int = 0
     total_row_count: int = 0
+    # rollout_ids of the rows that verified (for the pass-rate curriculum).
+    valid_rollout_ids: tuple[str, ...] = ()
 
 
 class RolloutReassembler:
@@ -747,6 +749,7 @@ class RolloutReassembler:
             metrics=metrics,
             valid_row_count=len(valid_rows),
             total_row_count=len(rows),
+            valid_rollout_ids=tuple(row.rollout_id for row in valid_rows),
         )
 
     # ── internals ───────────────────────────────────────────────────────────

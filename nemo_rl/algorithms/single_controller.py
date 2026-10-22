@@ -2109,6 +2109,11 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
+                            # Before the drop decision below: a group dropped for too
+                            # few verified rows still tells the curriculum something.
+                            self._rollout_manager.record_finalized_group(
+                                request, finalized
+                            )
                             min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
                             below_threshold = (
                                 min_valid_fraction is not None
@@ -3167,6 +3172,10 @@ class SingleControllerActor:
                     step_metrics.update(self._rollout_manager.pop_mask_rule_metrics())
                 except Exception as error:  # metrics must never fail a step
                     log.warning("Skipping mask_rules metrics: %s", error)
+                try:
+                    step_metrics.update(self._rollout_manager.curriculum_metrics())
+                except Exception as error:  # metrics must never fail a step
+                    log.warning("Skipping curriculum metrics: %s", error)
                 per_group_rollout_metrics: dict[str, list[Any]] = {}
                 for group_metrics in selected_rollout_metrics:
                     for metric_name, value in group_metrics.items():

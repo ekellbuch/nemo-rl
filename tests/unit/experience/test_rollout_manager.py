@@ -40,6 +40,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.curriculum_sampler import (
+    PassRateCurriculumConfig,
+    PassRateCurriculumSampler,
+)
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
@@ -372,6 +376,7 @@ def _make_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._curriculum = None
     return mgr
 
 
@@ -1892,6 +1897,7 @@ def _make_capture_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._curriculum = None
     mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._data_plane_checkpoint_barrier = buf.data_plane_checkpoint_barrier
     mgr._agent_implementations = None
@@ -2318,3 +2324,134 @@ class TestPerLabelGroupMetrics:
         )
         assert RolloutManager._group_agent_name(None, {"extra_env_info": {}}) is None
         assert RolloutManager._group_agent_name(None, {}) is None
+
+
+def _curriculum(num_tasks: int = 8) -> PassRateCurriculumSampler:
+    # A negligible prior, so pass rates read as plain decayed pass/attempt ratios.
+    return PassRateCurriculumSampler(
+        num_tasks,
+        PassRateCurriculumConfig(enabled=True, prior_strength=1e-9),
+        group_size=4,
+        seed=0,
+    )
+
+
+def _graded_record(
+    prompt_idx: int,
+    rewards: list[float],
+    *,
+    masked: tuple[int, ...] = (),
+    loss_multiplier: float = 1.0,
+) -> PromptGroupRecord:
+    return PromptGroupRecord(
+        prompt_idx=prompt_idx,
+        prompt=[],
+        extra_env_info=None,
+        metadata={},
+        completions=[
+            SimpleNamespace(
+                reward=reward,
+                env_extras=(
+                    {"instance_config": {"mask_sample": True}} if i in masked else {}
+                ),
+            )
+            for i, reward in enumerate(rewards)
+        ],
+        rollout_metrics={},
+        loss_multiplier=loss_multiplier,
+    )
+
+
+class TestCurriculumFeedback:
+    def test_committed_group_updates_its_task(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_graded_record(3, [1.0, 0.0, 1.0, 0.0]))
+        )
+        mgr._curriculum = _curriculum()
+
+        assert _run(mgr.generate_and_push({"idx": 3})) is RolloutOutcome.COMMITTED
+
+        assert mgr._curriculum.pass_rates()[3].item() == pytest.approx(0.5)
+        assert mgr.curriculum_metrics()["curriculum/tracked_tasks"] == 1.0
+
+    def test_all_pass_group_updates_its_task(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_graded_record(2, [1.0, 1.0, 1.0, 1.0]))
+        )
+        mgr._curriculum = _curriculum()
+
+        _run(mgr.generate_and_push({"idx": 2}))
+
+        metrics = mgr.curriculum_metrics()
+        assert metrics["curriculum/tracked_tasks"] == 1.0
+        assert metrics["curriculum/all_pass_fraction"] == 1.0
+
+    def test_env_masked_rollouts_are_not_attempts(self):
+        mgr = _make_manager(
+            _FakeBuffer(),
+            _FakeImpl(record=_graded_record(1, [1.0, 0.0, 0.0, 0.0], masked=(2, 3))),
+        )
+        mgr._curriculum = _curriculum()
+
+        _run(mgr.generate_and_push({"idx": 1}))
+
+        # Two counted rollouts, one pass: 1/2 rather than 1/4.
+        assert mgr._curriculum.pass_rates()[1].item() == pytest.approx(0.5)
+
+    def test_a_loss_masked_prompt_is_not_counted(self):
+        mgr = _make_manager(
+            _FakeBuffer(),
+            _FakeImpl(record=_graded_record(1, [1.0, 0.0], loss_multiplier=0.0)),
+        )
+        mgr._curriculum = _curriculum()
+
+        _run(mgr.generate_and_push({"idx": 1}))
+
+        assert mgr.curriculum_metrics()["curriculum/tracked_tasks"] == 0.0
+
+    def test_failed_rollout_is_not_counted(self):
+        class _FailingImpl:
+            async def run_rollout(self, input_sample):
+                raise RuntimeError("deterministic data failure")
+
+        mgr = _make_manager(
+            _FakeBuffer(),
+            _FailingImpl(),
+            retry_policy=RolloutRetryPolicy(
+                max_infra_attempts=1,
+                max_data_attempts=1,
+                max_gym_row_attempts=1,
+                max_skipped_prompts=8,
+            ),
+        )
+        mgr._curriculum = _curriculum()
+
+        assert _run(mgr.generate_and_push({"idx": 1})) is RolloutOutcome.SKIPPED
+
+        assert mgr.curriculum_metrics()["curriculum/groups_observed_total"] == 0.0
+
+    def test_finalized_capture_group_drops_masked_and_unverified_rows(self):
+        mgr = _make_manager(_FakeBuffer(), _FakeImpl())
+        mgr._curriculum = _curriculum()
+        request = SimpleNamespace(
+            prompt_idx=4,
+            rollout_ids=("r0", "r1", "r2", "r3"),
+            rewards=(1.0, 1.0, 0.0, 1.0),
+            mask_sample=(False, True, False, False),
+            loss_multiplier=1.0,
+        )
+        # r1 is env-masked and r3 failed to verify; r0 and r2 count.
+        finalized = SimpleNamespace(valid_rollout_ids=("r0", "r1", "r2"))
+
+        mgr.record_finalized_group(request, finalized)
+
+        assert mgr._curriculum.pass_rates()[4].item() == pytest.approx(0.5)
+
+    def test_curriculum_off_is_a_no_op(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_graded_record(0, [1.0, 0.0]))
+        )
+
+        _run(mgr.generate_and_push({"idx": 0}))
+
+        assert mgr.curriculum_metrics() == {}

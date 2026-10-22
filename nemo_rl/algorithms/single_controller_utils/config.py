@@ -1162,6 +1162,33 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "Remove it, or add a `ppo` block with policy_training_start_step > 0."
         )
 
+    if is_ppo_run(master_config):
+        # getattr: PPO's config has no curriculum field, so one here is an unread extra; a
+        # disabled block (e.g. copied from a GRPO config) is harmless.
+        curriculum = getattr(algo_cfg, "curriculum", None)
+        if isinstance(curriculum, dict):
+            curriculum_enabled = bool(curriculum.get("enabled", False))
+        else:
+            curriculum_enabled = bool(getattr(curriculum, "enabled", False))
+        if curriculum_enabled:
+            raise ValueError(
+                "ppo.curriculum is not supported: the pass-rate curriculum is "
+                "GRPO-only and the PPO path never builds it. Remove the block."
+            )
+    else:
+        curriculum_cfg = cast(GRPOConfig, algo_cfg).curriculum
+        if (
+            curriculum_cfg.enabled
+            and curriculum_cfg.weighting == "mixed_group"
+            and algo_cfg.num_generations_per_prompt < 2
+        ):
+            raise ValueError(
+                "grpo.curriculum.weighting='mixed_group' requires "
+                "num_generations_per_prompt >= 2: a single rollout never has reward "
+                "spread, so every task would sit at the weight floor. Use 'variance' "
+                f"instead (got {algo_cfg.num_generations_per_prompt})."
+            )
+
     if not is_ppo_run(master_config):
         # A value block without `ppo` is inert -- nothing builds the critic --
         # and a config carrying one is asking for PPO by every reading except

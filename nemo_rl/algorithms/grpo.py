@@ -69,6 +69,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.curriculum_sampler import PassRateCurriculumConfig
 from nemo_rl.data.dataloader import CyclingDataLoader, MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
@@ -380,6 +381,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
+    # Online pass-rate curriculum over training prompts; SingleController path only.
+    curriculum: PassRateCurriculumConfig = Field(
+        default_factory=PassRateCurriculumConfig
+    )
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
@@ -684,6 +689,15 @@ def setup(
             "This entry point never reads it, so leaving it enabled here would "
             "silently train the sampled-token top-k objective instead of the "
             "full-vocabulary reverse KL."
+        )
+
+    # The curriculum sampler is wired into the SingleController dataloader only.
+    if grpo_config.curriculum.enabled:
+        raise ValueError(
+            "grpo.curriculum is only implemented on the SingleController runtime "
+            "(examples/run_grpo_single_controller.py). This entry point builds a "
+            "plain shuffled dataloader, so leaving it enabled here would silently "
+            "train without the curriculum."
         )
 
     # Set seed for all random number generators

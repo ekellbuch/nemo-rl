@@ -171,6 +171,7 @@ def _manager(
     manager._recovery_siblings_redispatched = 0
     manager._skipped_prompts = 0
     manager._consecutive_infra_drops = 0
+    manager._curriculum = None
     manager.prompt_by_group_id: dict[str, int] = {}
     return manager
 

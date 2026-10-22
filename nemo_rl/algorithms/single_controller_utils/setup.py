@@ -78,6 +78,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.curriculum_sampler import (
+    PassRateCurriculumSampler,
+    load_init_stats,
+)
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
@@ -801,6 +805,55 @@ def _generation_max_seq_len(generation_config) -> int:
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
+def _curriculum_task_name(datum: Any) -> Optional[str]:
+    """A row's identity for ``grpo.curriculum.init_stats_path``: its Gym row's task_name."""
+    extra_env_info = datum.get("extra_env_info") if isinstance(datum, dict) else None
+    if isinstance(extra_env_info, dict) and extra_env_info.get("task_name"):
+        return str(extra_env_info["task_name"])
+    return None
+
+
+def _build_curriculum_sampler(
+    master_config: MasterConfig, train_dataset: Any
+) -> Optional[PassRateCurriculumSampler]:
+    """The pass-rate curriculum sampler for the training dataloader, or None if off."""
+    # GRPO-only; validation rejects a curriculum block on a PPO run.
+    grpo_cfg = master_config.grpo
+    if is_ppo_run(master_config) or grpo_cfg is None or not grpo_cfg.curriculum.enabled:
+        return None
+    sampler = PassRateCurriculumSampler(
+        len(train_dataset),
+        grpo_cfg.curriculum,
+        group_size=grpo_cfg.num_generations_per_prompt,
+        seed=grpo_cfg.seed,
+    )
+    init_stats_path = grpo_cfg.curriculum.init_stats_path
+    if init_stats_path:
+        init_stats = load_init_stats(init_stats_path)
+        matched_names = set()
+        seeded_rows = 0
+        # Every row with a matching task_name is seeded (a repeated dataset seeds each copy).
+        for index in range(len(train_dataset)):
+            name = _curriculum_task_name(train_dataset[index])
+            if name in init_stats:
+                sampler.set_initial_counts(index, *init_stats[name])
+                matched_names.add(name)
+                seeded_rows += 1
+        if not seeded_rows:
+            raise ValueError(
+                f"grpo.curriculum.init_stats_path={init_stats_path}: no training row's "
+                "task_name (extra_env_info.task_name) matches an entry; check the file "
+                "was built from this dataset."
+            )
+        print(
+            f"curriculum: seeded {seeded_rows} of {len(train_dataset)} rows from "
+            f"{init_stats_path} ({len(init_stats) - len(matched_names)} of "
+            f"{len(init_stats)} entries match no row)",
+            flush=True,
+        )
+    return sampler
+
+
 def _clamp_max_num_steps(
     master_config: MasterConfig, dataloader: StatefulDataLoader
 ) -> None:
@@ -1447,10 +1500,13 @@ def setup_single_controller(
         )
         assert len(response_data) == 4
         dataset, _val_dataset, env_handles, _val_env_handles = response_data
+    curriculum_sampler = _build_curriculum_sampler(master_config, dataset)
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=algo_cfg.num_prompts_per_step,
-        shuffle=data_config["shuffle"],
+        # The curriculum draws its own order, so it replaces shuffle.
+        shuffle=data_config["shuffle"] if curriculum_sampler is None else None,
+        sampler=curriculum_sampler,
         collate_fn=rl_collate_fn,
         drop_last=True,
         num_workers=data_config["num_workers"],
@@ -1974,6 +2030,14 @@ def setup_single_controller(
             # until every finalizer's process-local TQ client has attached and
             # registered its checkpoint participant.
             ray.get([actor.__ray_ready__.remote() for actor in finalizer_actors])
+    # Finished groups update the sampler that draws prompts. The manager and the
+    # dataloader reach the controller in one pickle (actor_args), so they keep
+    # sharing this one object there.
+    curriculum = (
+        dataloader.sampler
+        if isinstance(dataloader.sampler, PassRateCurriculumSampler)
+        else None
+    )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -1999,6 +2063,7 @@ def setup_single_controller(
         ),
         retry_policy=_build_retry_policy(master_config),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+        curriculum=curriculum,
     )
 
     # Print setup timing metrics

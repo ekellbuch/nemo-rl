@@ -27,6 +27,15 @@ grpo:
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
+  curriculum:
+    enabled: false
+    weighting: mixed_group
+    decay: 0.7
+    prior_pass_rate: 0.5
+    prior_strength: 2.0
+    min_weight: 0.05
+    pass_threshold: 0.5
+    init_stats_path: null
   reward_shaping:
     enabled: false
     overlong_buffer_length: 128
