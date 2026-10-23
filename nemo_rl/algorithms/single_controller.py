@@ -134,6 +134,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
     reduce_rollout_stats,
     staleness_stats,
 )
+from nemo_rl.algorithms.single_controller_utils.sample_dump import (
+    sample_dump_rows,
+    write_sample_dump,
+)
 from nemo_rl.algorithms.single_controller_utils.sample_masks import (
     baseline_valid_mask,
 )
@@ -169,6 +173,7 @@ from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
     GENERATION_TOPK_FIELDS,
+    INPUT_IDS,
     INPUT_LENGTHS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
@@ -756,6 +761,11 @@ class SingleControllerActor:
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
+        # grpo.dump_train_samples: the step's rows, written at step end.
+        self._sample_dump_dir = os.path.join(
+            master_config.logger.get("log_dir") or "logs", "train_samples"
+        )
+        self._sample_dump_rows: list[dict[str, Any]] = []
         # Per-sample rollout distributions (generated tokens, assistant turns,
         # group reward mix, context use); see single_controller_utils/rollout_stats.py.
         self._rollout_stats_acc = new_rollout_stats_accumulator()
@@ -3192,6 +3202,21 @@ class SingleControllerActor:
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
+                if (
+                    getattr(self._algo_cfg, "dump_train_samples", False)
+                    and self._sample_dump_rows
+                ):
+                    try:  # a diagnostic dump must never fail a step
+                        await asyncio.to_thread(
+                            write_sample_dump,
+                            self._sample_dump_dir,
+                            self._train_steps + 1,
+                            version_during_step,
+                            self._sample_dump_rows,
+                        )
+                    except Exception as error:
+                        log.warning("Skipping train sample dump: %s", error)
+                    self._sample_dump_rows = []
                 self._rollout_stats_acc = new_rollout_stats_accumulator()
                 self._masking_stats_acc = new_masking_stats_accumulator()
                 step_metrics.update(
@@ -5237,6 +5262,17 @@ class SingleControllerActor:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
+        if getattr(self._algo_cfg, "dump_train_samples", False):
+            await self._collect_sample_dump(
+                meta,
+                data,
+                rewards=rewards,
+                sample_mask=sample_mask,
+                final_sample_mask=final_sample_mask,
+                mask_sample=mask_sample,
+                truncated=truncated,
+            )
+
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -5432,6 +5468,51 @@ class SingleControllerActor:
             meta.with_fields(new_fields),
             has_valid_training_tokens,
         )
+
+    async def _collect_sample_dump(
+        self,
+        meta: KVBatchMeta,
+        data: Any,
+        **masks: torch.Tensor,
+    ) -> None:
+        """Keep this chunk's rows for the step's grpo.dump_train_samples file."""
+        adv_cfg = self._advantage_cfg
+        try:  # a diagnostic dump must never fail a step
+            tokens = await call_data_plane(
+                self._dp_client,
+                "get_samples",
+                sample_ids=meta.sample_ids,
+                partition_id=meta.partition_id,
+                select_fields=[
+                    INPUT_IDS,
+                    INPUT_LENGTHS,
+                    adv_cfg.generation_logprobs_field,
+                ],
+            )
+            self._sample_dump_rows.extend(
+                sample_dump_rows(
+                    sample_ids=list(meta.sample_ids),
+                    tags=list(meta.tags or []),
+                    input_ids=tensor_field(tokens, INPUT_IDS),
+                    input_lengths=squeeze_trailing_unit_dim(
+                        tensor_field(tokens, INPUT_LENGTHS)
+                    ),
+                    token_mask=tensor_field(data, adv_cfg.token_mask_field),
+                    generation_logprobs=tensor_field(
+                        tokens, adv_cfg.generation_logprobs_field
+                    ),
+                    # The trainer's log-probs of the same tokens (absent when no
+                    # policy log-prob pass runs).
+                    prev_logprobs=(
+                        tensor_field(data, adv_cfg.policy_logprobs_field)
+                        if self._policy_logprobs_required
+                        else None
+                    ),
+                    **masks,
+                )
+            )
+        except Exception as error:
+            log.warning("Skipping train sample dump for a chunk: %s", error)
 
     # ── utility helpers ────────────────────────────────────────────────────
 

@@ -405,6 +405,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     deduplicate_multimodal_data: bool = False
     # Emit exact-boundary and logical-vs-physical payload metrics.
     debug_payload_metrics: bool = False
+    # SingleController GRPO only. Write each step's rows (token ids, token mask,
+    # vLLM and trainer log-probs, masks, reward, receipt identity) to
+    # <logger.log_dir>/train_samples/step_<n>.jsonl.gz, for offline checks.
+    dump_train_samples: bool = False
 
 
 @dataclass

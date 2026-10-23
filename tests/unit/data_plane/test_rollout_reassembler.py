@@ -264,6 +264,49 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
+def test_finalize_group_stamps_capture_identity_tags(tq_client, partitions):
+    from nemo_gym.token_id_capture.staging.digest import hash_token_ids
+
+    group_id = "grp_capture"
+    receipt, expected = _stage_fixture(
+        tq_client, "worked_example", rollout_id=f"{group_id}_g0"
+    )
+    receipt["rollout_id"] = f"{group_id}_g0"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    finalized = _finalizer(tq_client, capture_identity_tags=True).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=0,
+        prompt_idx=3,
+    )
+    assert finalized.meta is not None
+    valid, lost = (tag["capture"] for tag in finalized.meta.tags)
+    # The receipt's terminal hash is Gym's hash of exactly the published row's tokens.
+    assert valid["cumulative_hash"] == hash_token_ids(expected.token_ids)
+    assert valid["cum_len"] == len(expected.token_ids)
+    assert valid["rollout_id"] == rollout_ids[0]
+    assert valid["rejection_reason"] is None
+    assert valid["manifest_calls"] == len(receipt["manifest"])
+    assert lost["rejection_reason"] == "missing_receipt"
+    # Off by default: no capture tag.
+    receipt2, _ = _stage_fixture(tq_client, "worked_example", rollout_id="grp_off_g0")
+    receipt2["rollout_id"] = "grp_off_g0"
+    plain = _finalizer(tq_client).finalize_group(
+        "grp_off",
+        ["grp_off_g0"],
+        [receipt2],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=0,
+        prompt_idx=3,
+    )
+    assert plain.meta is not None
+    assert "capture" not in plain.meta.tags[0]
+
+
 STAGING_PARTITION_TOPK = "rollout_staging_topk_fin_test"
 CANONICAL_PARTITION_TOPK = "rollout_data_topk_fin_test"
 TOPK = 3

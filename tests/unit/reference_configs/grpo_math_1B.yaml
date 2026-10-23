@@ -24,6 +24,7 @@ grpo:
   stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
+  dump_train_samples: false  # SingleController GRPO only: when true, write each step's rows to <logger.log_dir>/train_samples/
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1

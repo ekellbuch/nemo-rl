@@ -93,6 +93,8 @@ class RolloutReassemblerActorConfig:
     max_seq_len: int
     # token_capture.top_logprobs: sampler top-k columns to assemble (0 = none).
     top_logprobs: int
+    # grpo.dump_train_samples: stamp each row's receipt identity on its tag.
+    capture_identity_tags: bool = False
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -148,6 +150,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
             top_logprobs=config.top_logprobs,
+            capture_identity_tags=config.capture_identity_tags,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

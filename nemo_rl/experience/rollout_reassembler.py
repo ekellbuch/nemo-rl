@@ -133,8 +133,11 @@ class RolloutReassembler:
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
         top_logprobs: int = 0,
+        capture_identity_tags: bool = False,
     ) -> None:
         self._dp_client = dp_client
+        # grpo.dump_train_samples: stamp each row's receipt identity on its tag.
+        self._capture_identity_tags = capture_identity_tags
         self._partition_id = partition_id
         self._pad_token_id = int(pad_token_id)
         self._max_seq_len = int(max_seq_len)
@@ -650,6 +653,9 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        if self._capture_identity_tags:
+            for tag, row, receipt in zip(tags, rows, receipts):
+                tag["capture"] = capture_identity(row, receipt)
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0
@@ -845,3 +851,28 @@ class RolloutReassembler:
         if remote is not None:
             return ray.get(remote(**kwargs))
         return method(**kwargs)
+
+
+def capture_identity(
+    row: FinalizedRollout, receipt: Optional[dict[str, Any]]
+) -> dict[str, Any]:
+    """A row's receipt identity, to join it with Gym's capture ledger offline."""
+    receipt = receipt if isinstance(receipt, dict) else {}
+    terminal_id = receipt.get("terminal_model_call_id")
+    terminal = next(
+        (
+            record
+            for record in receipt.get("manifest") or []
+            if isinstance(record, dict) and record.get("model_call_id") == terminal_id
+        ),
+        {},
+    )
+    return {
+        "rollout_id": row.rollout_id,  # Gym's physical rollout id (ledger file name)
+        "rejection_reason": row.rejection_reason,
+        "manifest_calls": len(row.staging_keys),
+        "terminal_model_call_id": terminal_id,
+        "cum_len": terminal.get("cum_len"),
+        "cumulative_hash": terminal.get("cumulative_hash"),
+        "chain_hash": terminal.get("chain_hash"),
+    }

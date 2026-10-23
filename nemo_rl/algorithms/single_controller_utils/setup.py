@@ -2022,6 +2022,9 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 top_logprobs=token_capture_cfg.top_logprobs,
+                capture_identity_tags=bool(
+                    getattr(algo_cfg, "dump_train_samples", False)
+                ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
