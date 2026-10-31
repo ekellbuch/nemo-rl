@@ -64,7 +64,11 @@ from nemo_rl.models.generation.vllm.worker_utils import (
     resolve_distributed_executor_backend,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
-from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.models.policy.utils import (
+    _is_nemotron_h_model_config,
+    _is_qwen35_model_config,
+    is_vllm_v1_engine_enabled,
+)
 from nemo_rl.telemetry.instrumentation import trace_fn
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
@@ -80,6 +84,25 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_qwen35_fp32_lm_head(
+    vllm_kwargs: dict[str, Any], vllm_version: str
+) -> None:
+    """Request vLLM 0.26.0's native FP32 logits projection for Qwen3.5."""
+    if vllm_version != "0.26.0":
+        raise RuntimeError(
+            "Qwen3.5 fp32_lm_head requires pinned vLLM 0.26.0, whose "
+            f"LogitsProcessor supports head_dtype=float32; got {vllm_version}."
+        )
+    hf_overrides = vllm_kwargs.setdefault("hf_overrides", {})
+    if not isinstance(hf_overrides, dict) or hf_overrides.get(
+        "head_dtype", "float32"
+    ) != "float32":
+        raise ValueError(
+            "Qwen3.5 fp32_lm_head requires hf_overrides.head_dtype=float32."
+        )
+    hf_overrides["head_dtype"] = "float32"
 
 
 def _context_capped_max_new_tokens(
@@ -475,10 +498,26 @@ class BaseVllmGenerationWorker:
         self.py_executable = sys.executable
 
         vllm_cfg = self.cfg["vllm_cfg"]
+        self._qwen35_fp32_lm_head = False
+        if vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg):
+            model_config = AutoConfig.from_pretrained(
+                self.model_name, trust_remote_code=True
+            )
+            self._qwen35_fp32_lm_head = _is_qwen35_model_config(model_config)
+            if not (
+                self._qwen35_fp32_lm_head
+                or _is_nemotron_h_model_config(model_config)
+            ):
+                raise ValueError(
+                    "vllm_cfg.fp32_lm_head supports only Nemotron-H or Qwen3.5."
+                )
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
-            nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
+            nemotron_h_fp32_lm_head=(
+                vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
+                and not self._qwen35_fp32_lm_head
+            ),
             require_moe_routed_experts_capture=bool(
                 (self.cfg.get("vllm_kwargs") or {}).get(
                     "enable_return_routed_experts", False
@@ -647,7 +686,9 @@ class BaseVllmGenerationWorker:
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
-        if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
+        if self._qwen35_fp32_lm_head:
+            _configure_qwen35_fp32_lm_head(vllm_kwargs, vllm.__version__)
+        elif not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron

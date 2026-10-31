@@ -242,20 +242,47 @@ def test_policy_accepts_matched_vllm_and_megatron_fp32_lm_head():
     assert policy.worker_group is not None
 
 
-def test_policy_warns_when_vllm_fp32_lm_head_model_is_not_nemotron_h():
+def test_policy_accepts_qwen35_vllm_fp32_lm_head():
     config = create_megatron_config("test-model", tp=1)
     config["megatron_cfg"]["fp32_lm_head"] = True
     set_vllm_generation(config, {"fp32_lm_head": True})
 
-    with pytest.warns(UserWarning, match="Nemotron-H"):
-        policy = construct_policy_with_mocks(
+    policy = construct_policy_with_mocks(
+        config,
+        model_config=SimpleNamespace(
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            model_type="qwen3_5",
+        ),
+    )
+
+    assert policy.worker_group is not None
+
+
+def test_policy_rejects_unsupported_vllm_fp32_lm_head_model():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    with pytest.raises(ValueError, match="supports only Nemotron-H or Qwen3.5"):
+        construct_policy_with_mocks(
             config,
             model_config=SimpleNamespace(
                 architectures=["Qwen2ForCausalLM"], model_type="qwen2"
             ),
         )
 
-    assert policy.worker_group is not None
+
+def test_policy_rejects_qwen35_conflicting_head_dtype():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    set_vllm_generation(config, {"fp32_lm_head": True})
+    config["generation"]["vllm_kwargs"] = {"hf_overrides": {"head_dtype": "bfloat16"}}
+
+    with pytest.raises(ValueError, match="head_dtype=float32"):
+        construct_policy_with_mocks(
+            config,
+            model_config=SimpleNamespace(model_type="qwen3_5"),
+        )
 
 
 def test_policy_accepts_nested_nemotron_h_model_config():

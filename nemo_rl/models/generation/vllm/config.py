@@ -73,7 +73,7 @@ class VllmSpecificArgs(TypedDict):
     # with generation-time processors should request ``raw_logprobs`` when
     # comparing generation and policy logprobs.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
-    # Nemotron-H only: compute vLLM Nemotron-H logits with an fp32 LM head.
+    # Compute vLLM logits with an fp32 LM head for Nemotron-H or Qwen3.5.
     # Pair this with policy.megatron_cfg.fp32_lm_head when using a Megatron
     # trainer.
     fp32_lm_head: NotRequired[bool]
@@ -131,7 +131,7 @@ class VllmSpecificArgs(TypedDict):
 def vllm_nemotron_h_fp32_lm_head_enabled(
     vllm_cfg: VllmSpecificArgs | dict[str, Any],
 ) -> bool:
-    """Return whether vLLM should run Nemotron-H logits with an fp32 head."""
+    """Return whether vLLM generation requests an fp32 LM head."""
     return bool(vllm_cfg.get("fp32_lm_head"))
 
 

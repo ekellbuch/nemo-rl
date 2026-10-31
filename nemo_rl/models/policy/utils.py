@@ -129,6 +129,7 @@ POLICY_WORKER_OVERRIDES = {
 
 _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
+_QWEN35_MODEL_TYPES = frozenset({"qwen3_5"})
 
 
 def reject_dtensor_v1(
@@ -211,6 +212,14 @@ def _is_nemotron_h_model_config(model_config: object) -> bool:
     )
 
 
+def _is_qwen35_model_config(model_config: object) -> bool:
+    model_type = _get_config_model_type(model_config)
+    return (
+        model_type is not None
+        and _normalize_model_type(model_type) in _QWEN35_MODEL_TYPES
+    )
+
+
 def _describe_model_config(model_config: object) -> str:
     model_type = _get_config_model_type(model_config)
     architectures = _get_config_architectures(model_config)
@@ -287,20 +296,28 @@ def validate_fp32_lm_head_config(
             "A one-sided fp32 head increases the generation/training logprob "
             "mismatch instead of reducing it."
         )
-    if (
-        vllm_fp32
-        and model_config is not None
-        and not _is_nemotron_h_model_config(model_config)
-    ):
-        warnings.warn(
-            "policy.generation.vllm_cfg.fp32_lm_head=true currently only "
-            "patches vLLM's Nemotron-H model implementation "
-            "(NemotronHForCausalLM). The configured policy model does not "
-            f"look like Nemotron-H ({_describe_model_config(model_config)}), "
-            "so vLLM generation will not execute an fp32 LM-head path.",
-            UserWarning,
-            stacklevel=2,
-        )
+    if vllm_fp32 and model_config is not None:
+        if not (
+            _is_nemotron_h_model_config(model_config)
+            or _is_qwen35_model_config(model_config)
+        ):
+            raise ValueError(
+                "policy.generation.vllm_cfg.fp32_lm_head=true supports only "
+                "Nemotron-H or Qwen3.5; got "
+                f"{_describe_model_config(model_config)}."
+            )
+        if _is_qwen35_model_config(model_config):
+            hf_overrides = (generation_config.get("vllm_kwargs") or {}).get(
+                "hf_overrides", {}
+            )
+            if not isinstance(hf_overrides, dict) or hf_overrides.get(
+                "head_dtype", "float32"
+            ) != "float32":
+                raise ValueError(
+                    "Qwen3.5 fp32_lm_head requires "
+                    "policy.generation.vllm_kwargs.hf_overrides.head_dtype="
+                    "float32 when specified."
+                )
 
 
 def resolve_model_class(
