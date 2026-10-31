@@ -1731,13 +1731,16 @@ class _NoOpDataPlane:
         del kwargs
 
 
-def _train_pump_controller(*, sampler) -> object:
+def _train_pump_controller(
+    *, sampler, num_prompts_per_step: int = 2, dynamic_sampling: bool = False
+) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(
-            num_prompts_per_step=2,
+            num_prompts_per_step=num_prompts_per_step,
             max_num_steps=1,
+            use_dynamic_sampling=dynamic_sampling,
         ),
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
@@ -1844,6 +1847,30 @@ def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
         ),
     ):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+
+def test_dynamic_sampling_refuses_seven_of_eight_groups_after_exhaustion() -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(
+        sampler=_ChunkedSampler(meta, chunks=7),
+        num_prompts_per_step=8,
+        dynamic_sampling=True,
+    )
+    ctrl._algo_cfg.num_generations_per_prompt = 32
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"rollout exhausted before a complete training step was assembled: dispatched 7/8",
+    ):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+    assert ctrl._train_steps == 0
 
 
 class _DroppingSampler(_OneThenEmptySampler):

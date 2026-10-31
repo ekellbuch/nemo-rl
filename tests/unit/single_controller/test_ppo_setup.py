@@ -378,6 +378,20 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
+    def test_accepts_grpo_dynamic_sampling_with_token_capture(self):
+        mc = _make_master_config()
+        mc.grpo.use_dynamic_sampling = True
+        mc.token_capture.enabled = True
+
+        validate_single_controller_config(mc)
+
+    def test_rejects_grpo_dynamic_sampling_without_token_capture(self):
+        mc = _make_master_config()
+        mc.grpo.use_dynamic_sampling = True
+
+        with pytest.raises(ValueError, match="token_capture.enabled=true"):
+            validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
     def test_accepts_overlong_filtering(self, algorithm: str):
         mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()

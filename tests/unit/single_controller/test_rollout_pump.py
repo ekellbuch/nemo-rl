@@ -56,6 +56,7 @@ from nemo_rl.data.curriculum_sampler import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
+from nemo_rl.experience.rollout_reassembler import has_trainable_reward_variation
 from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutRecoveryState,
@@ -1370,10 +1371,16 @@ def test_windowed_dynamic_sampling_refills_constant_reward_group() -> None:
         cleaned: list[str] = []
 
         async def _finalize(request: Any) -> Any:
+            rewards = [0.0] * 32
+            if request.group_id != "g0":
+                rewards[-1] = 1.0
+            rows = [SimpleNamespace(valid=True, reward=reward) for reward in rewards]
             return SimpleNamespace(
-                has_reward_variation=request.group_id != "g0",
-                total_row_count=32,
-                valid_row_count=32,
+                has_reward_variation=has_trainable_reward_variation(
+                    rows, [False] * 32, 1.0
+                ),
+                total_row_count=len(rows),
+                valid_row_count=len(rows),
             )
 
         async def _cleanup(request: Any) -> None:
@@ -1387,7 +1394,10 @@ def test_windowed_dynamic_sampling_refills_constant_reward_group() -> None:
         )
         ctrl._master_config = SimpleNamespace(
             grpo=GRPOConfig.model_construct(
-                max_num_epochs=1, use_dynamic_sampling=True
+                max_num_epochs=1,
+                num_prompts_per_step=8,
+                num_generations_per_prompt=32,
+                use_dynamic_sampling=True,
             ),
             token_capture=SimpleNamespace(min_valid_fraction_per_group=None),
         )
@@ -1425,6 +1435,7 @@ def test_windowed_dynamic_sampling_refills_constant_reward_group() -> None:
         assert manager.dropped == 1
         assert cleaned == ["g0"]
         assert ctrl._buffer_capacity._value == 1
+        assert ctrl._target_groups_for_step(0) == 8
 
     asyncio.run(_main())
 

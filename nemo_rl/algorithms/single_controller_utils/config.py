@@ -1080,8 +1080,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path.
+    one a GRPO run carries and would never build. Reward scaling and shaping
+    are not implemented; GRPO dynamic sampling requires token finalization.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1095,13 +1095,25 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "with max_num_steps."
         )
 
-    # An enabled one here describes shaping this run does not do. An entry leaves
-    # this list once the SC path implements it; overlong_filtering is applied in
-    # the advantage stage from the raw completion flags in the TransferQueue.
+    if (
+        not is_ppo_run(master_config)
+        and algo_cfg.use_dynamic_sampling
+        and not master_config.token_capture.enabled
+    ):
+        raise ValueError(
+            "GRPO dynamic sampling requires token_capture.enabled=true "
+            "to filter constant-reward prompt groups before training"
+        )
+
+    # Reward scaling and shaping are not applied on this path. GRPO dynamic
+    # sampling is handled by the token finalizer and rollout pump; PPO is not.
     unsupported = [
         name
         for name, enabled in (
-            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
+            (
+                "use_dynamic_sampling",
+                is_ppo_run(master_config) and algo_cfg.use_dynamic_sampling,
+            ),
             ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
         )
