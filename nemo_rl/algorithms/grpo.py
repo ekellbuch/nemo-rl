@@ -521,6 +521,24 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_dppo_sampling(master_config: MasterConfig) -> None:
+    """The DPPO ratio must compare probabilities from the same sampling law."""
+    if master_config.loss_fn.dppo_tv_threshold is None:
+        return
+    generation = master_config.policy["generation"]
+    if generation["backend"] != "vllm":
+        raise ValueError("DPPO currently requires vLLM behavior logprobs")
+    if (
+        generation["top_p"] != 1.0
+        or generation["top_k"] is not None
+        or generation["temperature"] != 1.0
+    ):
+        raise ValueError(
+            "DPPO requires policy.generation top_p=1.0, top_k=null, "
+            "temperature=1.0 for behavior-logprob parity"
+        )
+
+
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
     """Reject configurations whose media transfer path is not qualified."""
     if not master_config.grpo.deduplicate_multimodal_data:
@@ -647,6 +665,7 @@ def setup(
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    _validate_dppo_sampling(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.

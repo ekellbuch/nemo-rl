@@ -117,6 +117,27 @@ class FinalizedGroup:
     total_row_count: int = 0
     # rollout_ids of the rows that verified (for the pass-rate curriculum).
     valid_rollout_ids: tuple[str, ...] = ()
+    # Reward variation among rows eligible for the policy loss. Dynamic
+    # sampling uses this before committing a prompt group to training.
+    has_reward_variation: bool = False
+
+
+def has_trainable_reward_variation(
+    rows: list[FinalizedRollout], mask_sample: list[bool], loss_multiplier: float
+) -> bool:
+    """Ignore placeholder and masked rows when testing a prompt group's rewards."""
+    if loss_multiplier == 0:
+        return False
+    return (
+        len(
+            {
+                row.reward
+                for row, masked in zip(rows, mask_sample, strict=True)
+                if row.valid and not masked
+            }
+        )
+        > 1
+    )
 
 
 class RolloutReassembler:
@@ -756,6 +777,9 @@ class RolloutReassembler:
             valid_row_count=len(valid_rows),
             total_row_count=len(rows),
             valid_rollout_ids=tuple(row.rollout_id for row in valid_rows),
+            has_reward_variation=has_trainable_reward_variation(
+                rows, mask_sample, loss_multiplier
+            ),
         )
 
     # ── internals ───────────────────────────────────────────────────────────

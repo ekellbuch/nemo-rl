@@ -1339,6 +1339,96 @@ def test_actor_path_feeds_kept_and_dropped_groups_to_the_curriculum() -> None:
     assert metrics["curriculum/all_pass_fraction"] == pytest.approx(0.5)
 
 
+def test_windowed_dynamic_sampling_refills_constant_reward_group() -> None:
+    class _RolloutManager:
+        def __init__(self) -> None:
+            self.stats = SimpleNamespace(committed=0)
+            self.generated: list[int] = []
+            self.dropped = 0
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: Any = None,
+        ) -> Any:
+            assert target_step is None
+            del inflight_registry
+            idx = prompt["idx"]
+            self.generated.append(idx)
+            return SimpleNamespace(group_id=f"g{idx}")
+
+        def record_finalized_group(self, *args: Any) -> None:
+            del args
+
+        def record_finalizer_dropped_prompt(self) -> None:
+            self.dropped += 1
+
+    async def _main() -> None:
+        manager = _RolloutManager()
+        cleaned: list[str] = []
+
+        async def _finalize(request: Any) -> Any:
+            return SimpleNamespace(
+                has_reward_variation=request.group_id != "g0",
+                total_row_count=32,
+                valid_row_count=32,
+            )
+
+        async def _cleanup(request: Any) -> None:
+            cleaned.append(request.group_id)
+
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1,
+            diagnostics=False,
+            rollout_failure=_failure_cfg(),
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(
+                max_num_epochs=1, use_dynamic_sampling=True
+            ),
+            token_capture=SimpleNamespace(min_valid_fraction_per_group=None),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        ctrl._rollout_manager = manager
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = _finalize
+        ctrl._cleanup_known_finalization_request = _cleanup
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=4)
+        ctrl._dataloader = [
+            BatchedDataDict(
+                {
+                    "message_log": [
+                        [{"role": "user", "content": str(i)}] for i in range(9)
+                    ],
+                    "idx": list(range(9)),
+                }
+            )
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(9)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await asyncio.wait_for(ctrl._rollout_pump(), timeout=3.0)
+
+        assert len(manager.generated) == 9
+        assert manager.stats.committed == 8
+        assert manager.dropped == 1
+        assert cleaned == ["g0"]
+        assert ctrl._buffer_capacity._value == 1
+
+    asyncio.run(_main())
+
+
 @pytest.mark.parametrize("committed", [False, True])
 def test_actor_finalization_discards_recovery_ledger_ownership(
     committed: bool,

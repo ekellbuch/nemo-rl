@@ -538,6 +538,14 @@ class SingleControllerActor:
         self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
         self._generation_router = getattr(actor_args, "generation_router", None)
         self._finalizer_actors = list(actor_args.finalizer_actors)
+        if (
+            getattr(self._algo_cfg, "use_dynamic_sampling", False)
+            and not self._finalizer_actors
+        ):
+            raise ValueError(
+                "SingleController dynamic sampling requires token_capture.enabled=true "
+                "so prompt-group rewards can be filtered before training"
+            )
         self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
         for actor in self._finalizer_actors:
             self._available_finalizers.put_nowait(actor)
@@ -2132,36 +2140,46 @@ class SingleControllerActor:
                                 / finalized.total_row_count
                                 < min_valid_fraction
                             )
-                            if not below_threshold:
+                            zero_variance = (
+                                getattr(self._algo_cfg, "use_dynamic_sampling", False)
+                                and not finalized.has_reward_variation
+                            )
+                            if not below_threshold and not zero_variance:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
-                            # Enough rows verified to publish, but too few to
-                            # be worth training on. Unlike the finalizer's own
-                            # structural drops above, this is a policy call
-                            # only the controller can act on: it is the one
-                            # component that can source a replacement.
+                            # The controller owns replacement decisions for
+                            # structurally valid groups excluded from training.
                             try:
                                 await self._cleanup_known_finalization_request(request)
                             except BaseException as cleanup_error:
                                 raise RuntimeError(
-                                    "finalizer group fell below "
-                                    "min_valid_fraction_per_group and "
-                                    "known-key cleanup failed for group "
+                                    "rejected finalizer group known-key cleanup failed "
+                                    "for group "
                                     f"{request.group_id}"
                                 ) from cleanup_error
-                            print(
-                                f"  finalize: group {request.group_id} below "
-                                "min_valid_fraction_per_group "
+                            reason = (
+                                "constant trainable rewards"
+                                if zero_variance
+                                else "below min_valid_fraction_per_group "
                                 f"({finalized.valid_row_count}/"
-                                f"{finalized.total_row_count} < "
-                                f"{min_valid_fraction}); seeking a replacement",
+                                f"{finalized.total_row_count} < {min_valid_fraction})"
+                            )
+                            print(
+                                f"  finalize: group {request.group_id} {reason}; "
+                                "discarding and refilling",
                                 flush=True,
                             )
                             replacement = self._take_replacement(
                                 target_step, replacements
                             )
                             if replacement is None:
+                                if zero_variance and target_step is not None:
+                                    raise RuntimeError(
+                                        "dynamic sampling could not replace a "
+                                        "constant-reward prompt group; "
+                                        "refusing a short training step"
+                                    )
                                 self._rollout_manager.record_finalizer_dropped_prompt()
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)

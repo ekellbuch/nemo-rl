@@ -197,6 +197,9 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # (TIS-weighted) score. Needs token_capture.top_logprobs > 0; composes only
     # with importance sampling off or token-level "tis".
     score_centering: bool = False
+    # Opt-in DPPO binary-TV trust region. The ratio is anchored on the rollout
+    # policy's recorded logprobs; None keeps the existing PPO/GRPO objective.
+    dppo_tv_threshold: float | None = None
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -462,6 +465,29 @@ class ClippedPGLossFn(LossFunction):
             if self.score_centering and self.use_importance_sampling_correction
             else None
         )
+        self.dppo_tv_threshold = cfg.dppo_tv_threshold
+        if self.dppo_tv_threshold is not None:
+            if not 0 < self.dppo_tv_threshold < 1:
+                raise ValueError("dppo_tv_threshold must be between 0 and 1")
+            if (
+                self.loss_type != LossType.TOKEN_LEVEL
+                or self.disable_ppo_ratio
+                or self.force_on_policy_ratio
+                or self.sequence_level_importance_ratios
+                or self.use_cispo
+                or self.ratio_clip_c is not None
+                or self.use_importance_sampling_correction
+                or self.truncated_importance_sampling_type is not None
+                or self.reference_policy_kl_penalty != 0
+                or self.positive_example_nll_weight != 0
+                or self.score_centering
+                or self.seq_logprob_error_in_loss
+                or self.opd_full is not None
+            ):
+                raise ValueError(
+                    "DPPO binary-TV requires token-level ratio loss with no PPO/IS "
+                    "variants, reference KL, NLL, or auxiliary objective"
+                )
 
         # Advertise, per returned metric, the global denominator it was
         # normalized by (see MetricNormalizer). Built here — next to the flags
@@ -505,6 +531,9 @@ class ClippedPGLossFn(LossFunction):
             "probs_ratio_clamped_min": MetricNormalizer.NONE,
             "probs_ratio_clamped_max": MetricNormalizer.NONE,
         }
+        if self.dppo_tv_threshold is not None:
+            self.metric_normalizations["dppo_masked_fraction"] = MetricNormalizer.TOKENS
+            self.metric_normalizations["dppo_binary_tv"] = MetricNormalizer.TOKENS
         if self.truncated_importance_sampling_type is not None:
             # Keyed on the TIS type, NOT loss_type: seq-mask-tis masks whole
             # sequences (÷ global_valid_seqs); tis/icepop are token-level.
@@ -613,6 +642,23 @@ class ClippedPGLossFn(LossFunction):
             )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
+        if self.dppo_tv_threshold is not None:
+            if generation_logprobs.shape != curr_logprobs.shape:
+                raise ValueError(
+                    "DPPO requires one behavior logprob per trainable token"
+                )
+            valid = mask.bool()
+            if (
+                not torch.isfinite(generation_logprobs[valid]).all()
+                or (generation_logprobs[valid] > 0).any()
+            ):
+                raise ValueError("DPPO requires finite rollout logprobs <= 0")
+            if (
+                not torch.isfinite(curr_logprobs[valid]).all()
+                or (curr_logprobs[valid] > 0).any()
+            ):
+                raise ValueError("DPPO requires finite policy logprobs <= 0")
+            prev_logprobs = generation_logprobs
 
         # For truly on-policy training, use curr_logprobs as prev_logprobs
         # This avoids computing prev_logprobs upstream
@@ -773,6 +819,12 @@ class ClippedPGLossFn(LossFunction):
             log_ratios = curr_logprobs - curr_logprobs.detach()
             ratios = log_ratios.exp()  # = exp(0) = 1.0, but depends on curr_logprobs
             ratios_clamped = ratios
+        elif self.dppo_tv_threshold is not None:
+            log_ratios = curr_logprobs - generation_logprobs
+            ratios = torch.where(valid, log_ratios, 0.0).exp()
+            if not torch.isfinite(ratios[valid]).all():
+                raise ValueError("DPPO rollout/policy ratio overflow")
+            ratios_clamped = ratios
         elif not self.disable_ppo_ratio:
             log_ratios = curr_logprobs - prev_logprobs
             if self.sequence_level_importance_ratios:
@@ -792,7 +844,33 @@ class ClippedPGLossFn(LossFunction):
             ratios = curr_logprobs
             ratios_clamped = curr_logprobs
 
-        if self.use_cispo:
+        dppo_metrics: dict[str, float] = {}
+        if self.dppo_tv_threshold is not None:
+            with torch.no_grad():
+                binary_tv = (
+                    curr_logprobs.clamp(min=-30.0, max=0.0).exp()
+                    - generation_logprobs.clamp(min=-30.0, max=0.0).exp()
+                ).abs()
+                outside = binary_tv > self.dppo_tv_threshold
+                blocked = outside & (
+                    ((advantages > 0) & (log_ratios > 0))
+                    | ((advantages < 0) & (log_ratios < 0))
+                )
+                keep = (~blocked & mask.bool()).to(curr_logprobs.dtype)
+                dppo_metrics = {
+                    "dppo_masked_fraction": masked_mean(
+                        blocked.float(),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                    "dppo_binary_tv": masked_mean(
+                        binary_tv,
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                }
+            clip_loss = -advantages * ratios * keep
+        elif self.use_cispo:
             clip_loss = -advantages * ratios_clamped.detach() * curr_logprobs
         else:
             loss1 = -advantages * ratios
@@ -1051,6 +1129,7 @@ class ClippedPGLossFn(LossFunction):
                 **_is_filter_metrics,
                 **seq_error_metrics,
                 **score_centering_metrics,
+                **dppo_metrics,
                 "positive_nll_loss": nll_loss.item(),
             },
         )
