@@ -1774,18 +1774,34 @@ class SingleControllerActor:
         ) as cut:
             await self._cleanup_known_finalization_request_unlocked(cut, request)
 
+    def _finalized_group_exclusion(
+        self, finalized: "FinalizedGroup"
+    ) -> tuple[bool, bool]:
+        """Return low-valid-fraction and zero-variance decisions for a group."""
+        min_valid_fraction = (
+            self._master_config.token_capture.min_valid_fraction_per_group
+        )
+        below_threshold = (
+            min_valid_fraction is not None
+            and finalized.total_row_count > 0
+            and finalized.valid_row_count / finalized.total_row_count
+            < min_valid_fraction
+        )
+        zero_variance = (
+            getattr(self._algo_cfg, "use_dynamic_sampling", False)
+            and not finalized.has_reward_variation
+        )
+        return below_threshold, zero_variance
+
     async def _finalize_with_actor(
         self, request: "ReassemblyRequest"
     ) -> Optional["FinalizedGroup"]:
         """Finalize and index one group atomically with respect to TQ saves.
 
-        Returns the committed FinalizedGroup once the group is committed to
-        the replay buffer (callers may read valid_row_count/total_row_count
-        off it to decide whether the group is worth keeping), or None when
-        the finalizer itself dropped it as a structural outcome (ownership
-        already cleaned up; the caller credits the step short). A low
-        valid-row fraction is no longer a finalizer-side drop -- the caller
-        decides that, since only the caller can source a replacement.
+        Accepted groups enter the replay buffer. Groups excluded by the
+        controller's training policy are cleaned before publication and
+        returned so the caller can decide whether to generate a replacement.
+        A structural finalizer drop returns None.
         """
         self._finalizer_waiters += 1
         queue_depth = max(
@@ -1865,6 +1881,17 @@ class SingleControllerActor:
                         "finalizer returned no metadata for non-dropped group "
                         f"{request.group_id}"
                     )
+                elif any(self._finalized_group_exclusion(finalized)):
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(
+                            cut, request
+                        )
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            "rejected finalizer group known-key cleanup failed "
+                            f"for group {request.group_id}"
+                        ) from cleanup_error
+                    return finalized
                 else:
                     # The post-write enricher (OPD teacher logprobs) routes on the
                     # group's agent_ref, which the request carries as metadata.
@@ -2132,32 +2159,14 @@ class SingleControllerActor:
                             self._rollout_manager.record_finalized_group(
                                 request, finalized
                             )
-                            min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
-                            below_threshold = (
-                                min_valid_fraction is not None
-                                and finalized.total_row_count > 0
-                                and finalized.valid_row_count
-                                / finalized.total_row_count
-                                < min_valid_fraction
-                            )
-                            zero_variance = (
-                                getattr(self._algo_cfg, "use_dynamic_sampling", False)
-                                and not finalized.has_reward_variation
+                            below_threshold, zero_variance = (
+                                self._finalized_group_exclusion(finalized)
                             )
                             if not below_threshold and not zero_variance:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
-                            # The controller owns replacement decisions for
-                            # structurally valid groups excluded from training.
-                            try:
-                                await self._cleanup_known_finalization_request(request)
-                            except BaseException as cleanup_error:
-                                raise RuntimeError(
-                                    "rejected finalizer group known-key cleanup failed "
-                                    "for group "
-                                    f"{request.group_id}"
-                                ) from cleanup_error
+                            min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
                             reason = (
                                 "constant trainable rewards"
                                 if zero_variance

@@ -1368,7 +1368,6 @@ def test_windowed_dynamic_sampling_refills_constant_reward_group() -> None:
 
     async def _main() -> None:
         manager = _RolloutManager()
-        cleaned: list[str] = []
 
         async def _finalize(request: Any) -> Any:
             rewards = [0.0] * 32
@@ -1382,9 +1381,6 @@ def test_windowed_dynamic_sampling_refills_constant_reward_group() -> None:
                 total_row_count=len(rows),
                 valid_row_count=len(rows),
             )
-
-        async def _cleanup(request: Any) -> None:
-            cleaned.append(request.group_id)
 
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
         ctrl._async_cfg = SimpleNamespace(
@@ -1406,7 +1402,6 @@ def test_windowed_dynamic_sampling_refills_constant_reward_group() -> None:
         _init_pump_ledgers(ctrl)
         ctrl._finalizer_actors = [object()]
         ctrl._finalize_with_actor = _finalize
-        ctrl._cleanup_known_finalization_request = _cleanup
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=4)
         ctrl._dataloader = [
             BatchedDataDict(
@@ -1433,7 +1428,6 @@ def test_windowed_dynamic_sampling_refills_constant_reward_group() -> None:
         assert len(manager.generated) == 9
         assert manager.stats.committed == 8
         assert manager.dropped == 1
-        assert cleaned == ["g0"]
         assert ctrl._buffer_capacity._value == 1
         assert ctrl._target_groups_for_step(0) == 8
 
