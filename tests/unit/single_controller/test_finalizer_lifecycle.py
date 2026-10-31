@@ -112,9 +112,12 @@ def _controller(actor: object) -> Any:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging"),
-        grpo=SimpleNamespace(num_prompts_per_step=1),
+        token_capture=SimpleNamespace(
+            staging_partition="staging", min_valid_fraction_per_group=None
+        ),
+        grpo=SimpleNamespace(num_prompts_per_step=1, use_dynamic_sampling=False),
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._trainer_version = 3
     ctrl._train_steps = 3
     return ctrl
@@ -158,6 +161,46 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         record=ANY,
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("dynamic_sampling", "min_valid_fraction"),
+    [(True, None), (False, 0.75)],
+)
+def test_rejected_group_is_not_published_to_replay_buffer(
+    dynamic_sampling: bool, min_valid_fraction: float | None
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        valid_row_count=0,
+        total_row_count=1,
+        has_reward_variation=False,
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    ctrl._master_config.grpo.use_dynamic_sampling = dynamic_sampling
+    ctrl._master_config.token_capture.min_valid_fraction_per_group = min_valid_fraction
+    ctrl._algo_cfg = ctrl._master_config.grpo
+
+    finalized = asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    assert finalized is result
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    ctrl._buffer.abort.assert_called_once_with("group")
+    assert ctrl._dp_client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:
